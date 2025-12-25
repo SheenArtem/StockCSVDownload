@@ -40,200 +40,145 @@ if st.button('🚀 開始批次抓取並打包'):
         # 初始化 FinMind Loader
         fm = DataLoader()
         
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i, ticker_symbol in enumerate(tickers):
-                status_text.text(f"正在下載 ({i+1}/{len(tickers)}): {ticker_symbol} ...")
-                progress_bar.progress((i + 1) / len(tickers))
+                # ... (進度條 code 不變)
                 
-                # 處理代號
+                # 判斷是否為台股 (全數字為台股)
+                is_tw_stock = ticker_symbol.isdigit()
+                
                 real_ticker = ticker_symbol
-                stock_id_only = ticker_symbol # 用於 FinMind (只要數字)
+                stock_id_only = ticker_symbol
                 
-                if ticker_symbol.isdigit():
+                if is_tw_stock:
                     real_ticker = f"{ticker_symbol}.TW"
-                    stock_id_only = ticker_symbol
-                else:
-                    # 美股無法抓 FinMind 籌碼，僅台股適用
-                    pass
-
+                
                 try:
-                    # 1. 下載股價 (YFinance)
+                    # 1. 下載股價 (YFinance - 台美股通用)
                     df = yf.download(real_ticker, period=period, interval="1d", progress=False)
                     
                     if not df.empty:
-                        # 清洗 YF 格式
+                        # 基礎清洗
                         if isinstance(df.columns, pd.MultiIndex):
                             df.columns = df.columns.get_level_values(0)
                         df.reset_index(inplace=True)
-                        # 確保 Date 是 datetime 格式且不含時區 (以便合併)
                         df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
 
-                        # 2. 下載籌碼 (FinMind) - 僅限台股數字代號
-                        if ticker_symbol.isdigit():
+                        # ==========================================
+                        #  🛡️ 安全初始化：先建立空欄位 (防呆關鍵)
+                        # ==========================================
+                        # 無論台美股，先預設這些籌碼欄位為 0
+                        # 這樣後面的公式運算就不會因為找不到欄位而當機
+                        chip_cols = [
+                            'Foreign_Net', 'Trust_Net', 'Dealer_Net', # 三大法人
+                            'Margin_Balance', 'Short_Balance',        # 融資券
+                            'Big_Hands_Pct', 'Small_Hands_Pct',       # 集保分佈
+                            'Chip_Spread'                             # 籌碼差
+                        ]
+                        for c in chip_cols:
+                            df[c] = 0.0
+
+                        # ==========================================
+                        #  🇹🇼 台股專屬：抓取 FinMind 籌碼
+                        # ==========================================
+                        if is_tw_stock:
                             try:
-                                # 設定起始日期 (配合 YF 的 period，這裡簡單抓 5 年以免不夠)
+                                # 設定 FinMind 起始日
                                 start_date = (datetime.now() - pd.DateOffset(years=5)).strftime('%Y-%m-%d')
                                 
-                                # A. 下載三大法人
-                                df_inst = fm.taiwan_stock_institutional_investors(
-                                    stock_id=stock_id_only, start_date=start_date
-                                )
+                                # A. 三大法人
+                                df_inst = fm.taiwan_stock_institutional_investors(stock_id=stock_id_only, start_date=start_date)
                                 if not df_inst.empty:
-                                    # 整理欄位：將 date 轉為 datetime，並 pivot 轉成寬表格
                                     df_inst['date'] = pd.to_datetime(df_inst['date'])
-                                    # 加總三大法人買賣超 (Foreign_Investor, Investment_Trust, Dealer)
-                                    # 這裡簡化：直接保留原始格式或 pivot
-                                    # 為了方便，我們計算「三大法人合計」與「外資」、「投信」
-                                    df_inst_pivot = df_inst.pivot_table(
-                                        index='date', 
-                                        columns='name', 
-                                        values=['buy', 'sell'], 
-                                        aggfunc='sum'
-                                    ).fillna(0)
+                                    pivot = df_inst.pivot_table(index='date', columns='name', values=['buy', 'sell'], aggfunc='sum').fillna(0)
                                     
-                                    # 算出淨買賣超 (Buy - Sell)
-                                    df_net = pd.DataFrame()
-                                    df_net['Foreign_Net'] = df_inst_pivot['buy']['Foreign_Investor'] - df_inst_pivot['sell']['Foreign_Investor']
-                                    df_net['Trust_Net'] = df_inst_pivot['buy']['Investment_Trust'] - df_inst_pivot['sell']['Investment_Trust']
-                                    df_net['Dealer_Net'] = df_inst_pivot['buy']['Dealer_Self_Analysis'] - df_inst_pivot['sell']['Dealer_Self_Analysis'] # 自營商(自行買賣)
+                                    # 寫入 DataFrame (使用 update 或 merge)
+                                    # 這裡為了簡單，先算出暫存 Series 再映射
+                                    # 注意：需處理可能的 Key Error (若某法人當天沒交易)
+                                    def get_net(name):
+                                        if name in pivot['buy'] and name in pivot['sell']:
+                                            return pivot['buy'][name] - pivot['sell'][name]
+                                        return 0
                                     
-                                    # 合併進主資料
-                                    df = pd.merge(df, df_net, left_on='Date', right_index=True, how='left')
+                                    # 建立暫存 DF 來合併，避免 Index 問題
+                                    temp_df = pd.DataFrame(index=pivot.index)
+                                    temp_df['Foreign_Net'] = get_net('Foreign_Investor')
+                                    temp_df['Trust_Net'] = get_net('Investment_Trust')
+                                    temp_df['Dealer_Net'] = get_net('Dealer_Self_Analysis') # 自營商(自行)
+                                    
+                                    # 合併進主表 (update 僅更新有值的)
+                                    df.set_index('Date', inplace=True)
+                                    df.update(temp_df)
+                                    df.reset_index(inplace=True)
 
-                                # B. 下載融資融券
-                                df_margin = fm.taiwan_stock_margin_purchase_short_sale(
-                                    stock_id=stock_id_only, start_date=start_date
-                                )
+                                # B. 融資融券
+                                df_margin = fm.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id_only, start_date=start_date)
                                 if not df_margin.empty:
                                     df_margin['date'] = pd.to_datetime(df_margin['date'])
                                     df_margin.set_index('date', inplace=True)
+                                    df_margin.rename(columns={'MarginPurchaseTodayBalance': 'Margin_Balance', 'ShortSaleTodayBalance': 'Short_Balance'}, inplace=True)
                                     
-                                    # 只取需要的欄位：融資餘額 (MarginPurchaseTodayBalance)
-                                    margin_cols = df_margin[['MarginPurchaseTodayBalance', 'ShortSaleTodayBalance']]
-                                    margin_cols.columns = ['Margin_Balance', 'Short_Balance'] # 改名
+                                    df.set_index('Date', inplace=True)
+                                    df.update(df_margin[['Margin_Balance', 'Short_Balance']])
+                                    df.reset_index(inplace=True)
+
+                                # C. 集保股權分散 (週資料)
+                                df_holding = fm.taiwan_stock_holding_shares_per(stock_id=stock_id_only, start_date=start_date)
+                                if not df_holding.empty:
+                                    df_holding['date'] = pd.to_datetime(df_holding['date'])
+                                    df_holding['percent'] = pd.to_numeric(df_holding['percent'], errors='coerce')
+                                    df_holding['HoldingSharesLevel'] = pd.to_numeric(df_holding['HoldingSharesLevel'], errors='coerce')
                                     
-                                    # 合併
-                                    df = pd.merge(df, margin_cols, left_on='Date', right_index=True, how='left')
-                                # C. 下載【集保大戶籌碼集中度】(每週更新)
-                                try:
-                                    # 抓取股權分散表
-                                    df_holding = fm.taiwan_stock_holding_shares_per(
-                                        stock_id=stock_id_only, 
-                                        start_date=start_date
-                                    )
+                                    # 大戶 (>400張, Level>=12) vs 散戶 (<5張, Level<=3)
+                                    grp = df_holding.groupby('date')
+                                    big = grp.apply(lambda x: x[x['HoldingSharesLevel'] >= 12]['percent'].sum())
+                                    small = grp.apply(lambda x: x[x['HoldingSharesLevel'] <= 3]['percent'].sum())
                                     
-                                    if not df_holding.empty:
-                                        df_holding['date'] = pd.to_datetime(df_holding['date'])
-                                        
-                                        # 轉換欄位格式，確保可以運算
-                                        df_holding['percent'] = pd.to_numeric(df_holding['percent'], errors='coerce')
-                                        df_holding['HoldingSharesLevel'] = pd.to_numeric(df_holding['HoldingSharesLevel'], errors='coerce')
-                                
-                                        # 邏輯：計算持有 > 400 張的大戶總比例
-                                        # 集保分級中，第 12 級以上通常代表 > 400 張 (依官方定義可能略有變動，但通常取 12-17 級或 14-17 級)
-                                        # 這裡示範加總 "12級~17級" (約 400張以上) 的持有比例
-                                        # 若要抓 1000 張以上，就改成 >= 14
-                                        big_hands = df_holding[df_holding['HoldingSharesLevel'] >= 12].groupby('date')['percent'].sum()
-                                        
-                                        # 整理成 DataFrame
-                                        df_big_hands = pd.DataFrame(big_hands).rename(columns={'percent': 'Big_Hand_Hold_Pct'})
-                                        
-                                        # 合併進主資料
-                                        # 注意：集保是「週資料」，日資料是「日資料」
-                                        # 我們用 "how='left'" 並在合併後做 "前值填充 (ffill)"
-                                        # 這樣週一到週四就會自動帶入上週五的大戶數據，方便畫圖
-                                        df = pd.merge(df, df_big_hands, left_on='Date', right_index=True, how='left')
-                                        df['Big_Hand_Hold_Pct'] = df['Big_Hand_Hold_Pct'].ffill()
-                                
-                                except Exception as e:
-                                    print(f"集保數據抓取失敗: {e}")
-                                    pass    
+                                    temp_hold = pd.DataFrame({'Big_Hands_Pct': big, 'Small_Hands_Pct': small})
+                                    temp_hold['Chip_Spread'] = temp_hold['Big_Hands_Pct'] - temp_hold['Small_Hands_Pct']
+                                    
+                                    # 合併並填補 (週 -> 日)
+                                    df.set_index('Date', inplace=True)
+                                    # 先 merge 會有空值，再 ffill
+                                    df = pd.merge(df, temp_hold, left_index=True, right_index=True, how='left', suffixes=('', '_new'))
+                                    # 更新欄位
+                                    for col in ['Big_Hands_Pct', 'Small_Hands_Pct', 'Chip_Spread']:
+                                        if f'{col}_new' in df.columns:
+                                            df[col] = df[f'{col}_new'].combine_first(df[col]) # 優先用新資料
+                                            df.drop(columns=[f'{col}_new'], inplace=True)
+                                    
+                                    df.reset_index(inplace=True)
+                                    # 針對集保數據做 ffill (讓週五數據延續到下週四)
+                                    df[['Big_Hands_Pct', 'Small_Hands_Pct', 'Chip_Spread']] = df[['Big_Hands_Pct', 'Small_Hands_Pct', 'Chip_Spread']].ffill()
+
                             except Exception as e:
-                                print(f"FinMind 數據抓取部分失敗: {e}")
-                                # 失敗不影響主流程，繼續存股價
+                                print(f"FinMind 錯誤 (不影響主流程): {e}")
+                                # 出錯了也沒關係，因為我們最上面已經「安全初始化」為 0 了
                                 pass
 
                         # ==========================================
-                        #  🔥 升級模組：真・主力分析 (集保 + EFI)
+                        #  🧮 通用計算：主力指標 & EFI (台美股皆可算)
                         # ==========================================
                         
-                        # --- Part 1: 上帝視角 (集保大戶 vs 散戶) ---
-                        # 這是最準確的籌碼指標，不管主力是誰都逃不過
-                        try:
-                            # 抓取每週股權分散表
-                            df_holding = fm.taiwan_stock_holding_shares_per(
-                                stock_id=stock_id_only, 
-                                start_date=start_date
-                            )
-                            
-                            if not df_holding.empty:
-                                df_holding['date'] = pd.to_datetime(df_holding['date'])
-                                df_holding['percent'] = pd.to_numeric(df_holding['percent'], errors='coerce')
-                                df_holding['HoldingSharesLevel'] = pd.to_numeric(df_holding['HoldingSharesLevel'], errors='coerce')
-
-                                # 定義「大戶」：持有 > 400 張 (等級 12 以上)
-                                # 定義「散戶」：持有 < 5 張 (等級 1~3)
-                                # 注意：等級劃分依集保定義，12級通常為 400,001-600,000
-                                
-                                # 計算大戶持股比例
-                                big_hands = df_holding[df_holding['HoldingSharesLevel'] >= 12].groupby('date')['percent'].sum()
-                                
-                                # 計算散戶持股比例 (螞蟻雄兵，通常是反向指標)
-                                small_hands = df_holding[df_holding['HoldingSharesLevel'] <= 3].groupby('date')['percent'].sum()
-                                
-                                df_dist = pd.DataFrame({
-                                    'Big_Hands_Pct': big_hands,
-                                    'Small_Hands_Pct': small_hands
-                                })
-                                
-                                # 算出「籌碼集中度差值」：大戶 - 散戶
-                                # 數值由負轉正 = 主力進場、散戶退場 (最佳買點)
-                                df_dist['Chip_Spread'] = df_dist['Big_Hands_Pct'] - df_dist['Small_Hands_Pct']
-                                
-                                # 合併 (注意集保是週資料，需用 ffill 填補到日線)
-                                df = pd.merge(df, df_dist, left_on='Date', right_index=True, how='left')
-                                df['Big_Hands_Pct'] = df['Big_Hands_Pct'].ffill()
-                                df['Small_Hands_Pct'] = df['Small_Hands_Pct'].ffill()
-                                df['Chip_Spread'] = df['Chip_Spread'].ffill()
-                                
-                        except Exception as e:
-                            print(f"集保數據運算錯誤: {e}")
-                            pass
-
-                        # --- Part 2: 數學主力 (Elder's Force Index) ---
-                        # 就算沒有籌碼數據，也能用「價量」算出主力力道
-                        # 公式：(今日收盤 - 昨日收盤) * 成交量
-                        
-                        # 確保 Volume 是數值
+                        # 1. 確保 Volume 是數值
                         df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0)
                         
-                        # 1. 原始力道 (Raw Force)
+                        # 2. 計算主力總買賣超 (美股這邊會是 0+0+0=0，不會報錯)
+                        df['Main_Force_Net'] = df['Foreign_Net'] + df['Trust_Net'] + df['Dealer_Net']
+
+                        # 3. 計算 5日/20日 集中度
+                        # 分母加 1e-9 避免除以零
+                        df['Concentration_5'] = (df['Main_Force_Net'].rolling(5).sum() / (df['Volume'].rolling(5).sum() + 1e-9) * 100).round(2)
+                        df['Concentration_20'] = (df['Main_Force_Net'].rolling(20).sum() / (df['Volume'].rolling(20).sum() + 1e-9) * 100).round(2)
+
+                        # 4. 埃爾德強力指標 (EFI) - 美股也可以用！
                         close_diff = df['Close'].diff()
                         df['Raw_Force'] = close_diff * df['Volume']
-                        
-                        # 2. 埃爾德強力指標 (EFI 13日) - 適合波段
-                        # EFI > 0 且上升：主力買進力道強
-                        # EFI < 0：主力賣出
                         df['EFI_13'] = df['Raw_Force'].ewm(span=13, adjust=False).mean()
-                        
-                        # 3. 巨量長紅檢測 (Big Bull Candle)
-                        # 邏輯：漲幅 > 3% 且 成交量 > 5日均量 * 1.5
-                        vol_ma5 = df['Volume'].rolling(5).mean()
-                        df['Is_Big_Bull'] = (
-                            (df['Close'].pct_change() > 0.03) & 
-                            (df['Volume'] > vol_ma5 * 1.5)
-                        ).astype(int)
 
                         # ==========================================
-                        
-                        # 最後填補與輸出
-                        cols_needed = ['Big_Hands_Pct', 'Small_Hands_Pct', 'Chip_Spread', 'EFI_13']
-                        for c in cols_needed:
-                            if c not in df.columns: df[c] = 0
-                            else: df[c] = df[c].fillna(0)
-                                
-                        # 3. 轉成 CSV 並寫入 ZIP
-                        # 填補 NaN (因為籌碼資料可能有缺漏日期)
+                        #  💾 存檔
+                        # ==========================================
                         df.fillna(0, inplace=True)
                         csv_data = df.to_csv(index=False).encode('utf-8-sig')
                         zf.writestr(f"{real_ticker}.csv", csv_data)
@@ -241,9 +186,8 @@ if st.button('🚀 開始批次抓取並打包'):
                         
                     else:
                         st.error(f"❌ {real_ticker} 查無資料")
-                        
                 except Exception as e:
-                    st.error(f"❌ {real_ticker} 下載失敗: {e}")
+                    st.error(f"❌ {real_ticker} 下載失敗: {e}"
 
         # 下載完成
         progress_bar.progress(100)
