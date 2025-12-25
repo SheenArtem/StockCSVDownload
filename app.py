@@ -40,7 +40,7 @@ if st.button('🚀 開始批次抓取並打包'):
         # 初始化 FinMind Loader
         fm = DataLoader()
         
-with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i, ticker_symbol in enumerate(tickers):
                 # ... (進度條 code 不變)
                 
