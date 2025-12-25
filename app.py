@@ -178,42 +178,78 @@ if st.button('🚀 開始批次抓取並打包 (Stocks)'):
             )
 
 # ==========================================
-#  區塊 2: 台指期專屬下載 (新增功能)
+#  區塊 2: 台指期專屬下載 (FinMind 版 - 最穩)
 # ==========================================
 st.markdown("---")
-st.subheader("2. ⏱️ 台指期 (WTX) 小時 K 下載")
-st.info("💡 下載近 730 天 (約2年) 的連續月台指期貨資料，週期為 1 小時 (1h)。適合上傳進行「日線+小時線」雙週期分析。")
+st.subheader("2. ⏱️ 台指期 (TX) 小時 K 下載 - FinMind 來源")
+st.info("💡 使用 FinMind 台灣在地數據源，解決 Yahoo Finance 常抓不到資料的問題。程式會自動將「分鐘線」合成「小時線」。")
 
-if st.button("🚀 下載台指期 (WTX=F) 小時 K"):
+# 讓使用者選擇開始日期
+start_date_input = st.date_input("開始日期", value=pd.to_datetime("2023-01-01"))
+
+if st.button("🚀 下載台指期 (TX) 小時 K"):
     
-    ticker_futures = "WTX=F" # Yahoo Finance 台指期連續月代號
-    
-    with st.spinner(f'正在下載 {ticker_futures} 小時線資料...'):
+    with st.spinner('正在從 FinMind 下載台指期分鐘資料並運算中 (需時較久，請稍候)...'):
         try:
-            # 強制設定：1小時, 2年 (Yahoo API 限制)
-            df_futures = yf.download(ticker_futures, period="2y", interval="1h", progress=False)
+            # 1. 初始化 DataLoader (使用您的 app.py 已有的 import)
+            fm = DataLoader()
             
-            if not df_futures.empty:
-                # 數據清洗
-                if isinstance(df_futures.columns, pd.MultiIndex):
-                    df_futures.columns = df_futures.columns.get_level_values(0)
-                df_futures.reset_index(inplace=True)
+            # 2. 下載台指期 (TX) 的 1 分鐘資料
+            # FinMind 的台指期代號通常是 'TX'
+            start_str = start_date_input.strftime('%Y-%m-%d')
+            df_min = fm.taiwan_futures_minute(
+                futures_id='TX',
+                start_date=start_str
+            )
+            
+            if not df_min.empty:
+                # 3. 數據清洗與重採樣 (Resample 1min -> 1h)
+                # 確保 date 是 datetime 格式並設為索引
+                df_min['date'] = pd.to_datetime(df_min['date'])
+                df_min.set_index('date', inplace=True)
                 
-                # 轉換為 CSV
-                csv_futures = df_futures.to_csv(index=False).encode('utf-8-sig')
+                # 定義合併規則 (OHLCV)
+                # Open取第一筆, High取最大, Low取最小, Close取最後, Volume取加總
+                logic = {
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }
                 
-                st.success(f"✅ 下載成功！資料區間：{df_futures['Datetime'].min()} 至 {df_futures['Datetime'].max()}")
+                # 執行重採樣 (1H = 1小時)
+                # label='left' 代表 09:00-10:00 的 K 線標示為 09:00
+                df_hour = df_min.resample('1H', label='left', closed='left').agg(logic)
                 
-                # 獨立下載按鈕
-                filename_futures = f"WTX_Hourly_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+                # 移除沒有成交量的時段 (例如夜盤休息時間或假日)
+                df_hour = df_hour[df_hour['volume'] > 0].dropna()
+                df_hour.reset_index(inplace=True)
+                
+                # 欄位重新命名以符合我的分析格式 (首字大寫)
+                df_hour.rename(columns={
+                    'date': 'Datetime', 
+                    'open': 'Open', 
+                    'high': 'High', 
+                    'low': 'Low', 
+                    'close': 'Close', 
+                    'volume': 'Volume'
+                }, inplace=True)
+
+                # 4. 產生 CSV
+                csv_futures = df_hour.to_csv(index=False).encode('utf-8-sig')
+                
+                st.success(f"✅ 下載成功！資料來源：FinMind | 區間：{df_hour['Datetime'].min()} 至 {df_hour['Datetime'].max()}")
+                
+                filename_futures = f"TX_Hourly_FinMind_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
                 st.download_button(
-                    label="📥 點擊下載 WTX_Hourly.csv",
+                    label=f"📥 點擊下載 {filename_futures}",
                     data=csv_futures,
                     file_name=filename_futures,
                     mime="text/csv"
                 )
             else:
-                st.error("❌ 下載失敗，Yahoo Finance 暫無數據 (可能是連線問題)。")
+                st.error("❌ 下載失敗：FinMind 回傳空資料，請檢查網路或縮短日期範圍。")
                 
         except Exception as e:
             st.error(f"❌ 發生錯誤: {e}")
