@@ -153,6 +153,85 @@ if st.button('🚀 開始批次抓取並打包'):
                                 # 失敗不影響主流程，繼續存股價
                                 pass
 
+                        # ==========================================
+                        #  🔥 升級模組：真・主力分析 (集保 + EFI)
+                        # ==========================================
+                        
+                        # --- Part 1: 上帝視角 (集保大戶 vs 散戶) ---
+                        # 這是最準確的籌碼指標，不管主力是誰都逃不過
+                        try:
+                            # 抓取每週股權分散表
+                            df_holding = fm.taiwan_stock_holding_shares_per(
+                                stock_id=stock_id_only, 
+                                start_date=start_date
+                            )
+                            
+                            if not df_holding.empty:
+                                df_holding['date'] = pd.to_datetime(df_holding['date'])
+                                df_holding['percent'] = pd.to_numeric(df_holding['percent'], errors='coerce')
+                                df_holding['HoldingSharesLevel'] = pd.to_numeric(df_holding['HoldingSharesLevel'], errors='coerce')
+
+                                # 定義「大戶」：持有 > 400 張 (等級 12 以上)
+                                # 定義「散戶」：持有 < 5 張 (等級 1~3)
+                                # 注意：等級劃分依集保定義，12級通常為 400,001-600,000
+                                
+                                # 計算大戶持股比例
+                                big_hands = df_holding[df_holding['HoldingSharesLevel'] >= 12].groupby('date')['percent'].sum()
+                                
+                                # 計算散戶持股比例 (螞蟻雄兵，通常是反向指標)
+                                small_hands = df_holding[df_holding['HoldingSharesLevel'] <= 3].groupby('date')['percent'].sum()
+                                
+                                df_dist = pd.DataFrame({
+                                    'Big_Hands_Pct': big_hands,
+                                    'Small_Hands_Pct': small_hands
+                                })
+                                
+                                # 算出「籌碼集中度差值」：大戶 - 散戶
+                                # 數值由負轉正 = 主力進場、散戶退場 (最佳買點)
+                                df_dist['Chip_Spread'] = df_dist['Big_Hands_Pct'] - df_dist['Small_Hands_Pct']
+                                
+                                # 合併 (注意集保是週資料，需用 ffill 填補到日線)
+                                df = pd.merge(df, df_dist, left_on='Date', right_index=True, how='left')
+                                df['Big_Hands_Pct'] = df['Big_Hands_Pct'].ffill()
+                                df['Small_Hands_Pct'] = df['Small_Hands_Pct'].ffill()
+                                df['Chip_Spread'] = df['Chip_Spread'].ffill()
+                                
+                        except Exception as e:
+                            print(f"集保數據運算錯誤: {e}")
+                            pass
+
+                        # --- Part 2: 數學主力 (Elder's Force Index) ---
+                        # 就算沒有籌碼數據，也能用「價量」算出主力力道
+                        # 公式：(今日收盤 - 昨日收盤) * 成交量
+                        
+                        # 確保 Volume 是數值
+                        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0)
+                        
+                        # 1. 原始力道 (Raw Force)
+                        close_diff = df['Close'].diff()
+                        df['Raw_Force'] = close_diff * df['Volume']
+                        
+                        # 2. 埃爾德強力指標 (EFI 13日) - 適合波段
+                        # EFI > 0 且上升：主力買進力道強
+                        # EFI < 0：主力賣出
+                        df['EFI_13'] = df['Raw_Force'].ewm(span=13, adjust=False).mean()
+                        
+                        # 3. 巨量長紅檢測 (Big Bull Candle)
+                        # 邏輯：漲幅 > 3% 且 成交量 > 5日均量 * 1.5
+                        vol_ma5 = df['Volume'].rolling(5).mean()
+                        df['Is_Big_Bull'] = (
+                            (df['Close'].pct_change() > 0.03) & 
+                            (df['Volume'] > vol_ma5 * 1.5)
+                        ).astype(int)
+
+                        # ==========================================
+                        
+                        # 最後填補與輸出
+                        cols_needed = ['Big_Hands_Pct', 'Small_Hands_Pct', 'Chip_Spread', 'EFI_13']
+                        for c in cols_needed:
+                            if c not in df.columns: df[c] = 0
+                            else: df[c] = df[c].fillna(0)
+                                
                         # 3. 轉成 CSV 並寫入 ZIP
                         # 填補 NaN (因為籌碼資料可能有缺漏日期)
                         df.fillna(0, inplace=True)
