@@ -5,6 +5,7 @@ import io
 import zipfile
 from datetime import datetime
 from FinMind.data import DataLoader
+
 # 設定網頁標題
 st.set_page_config(page_title="大量股票數據批次下載器", page_icon="📦")
 st.title('📦 台股/美股 批次資料下載器')
